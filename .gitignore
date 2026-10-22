@@ -1,0 +1,48 @@
+# ---- Keil MDK 构建产物 ----
+Objects/
+Listings/
+DebugConfig/
+*.uvguix.*
+*.bak
+*.dep
+*.lnp
+*.sct
+*.build_log.htm
+*.htm
+*.iex
+*.axf
+*.hex
+*.bin
+*.map
+*.lst
+*.o
+*.d
+*.crf
+*.a
+*.lib
+*.sbr
+*.i
+*.__i
+*.m51
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- 本地临时文件 ----
+*.log
+*.tmp
+/tmp/
