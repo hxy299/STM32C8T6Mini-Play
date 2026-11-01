@@ -144,6 +144,7 @@
 │   ├── M6-M7_TOF验收说明.md
 │   ├── M9_TTS转发验收说明.md
 │   ├── TOF两传感器配置说明.md
+│   ├── 上位机对接手册.md        ★ 上位机看这份
 │   └── 蓝牙遥控与双源仲裁.md
 └── tools/
     ├── pc_link_test.py    ★ PC 端交互测试工具
@@ -201,6 +202,10 @@ USE_STDPERIPH_DRIVER, STM32F10X_MD
 
 ## 6. 通信协议
 
+> ⚠️ **本节只是摘要。对接上位机请直接看 [上位机对接手册](docs/上位机对接手册.md)** —— 里面有每个命令的完整 payload 布局、字节级示例、状态码/detail 的歧义说明和实现检查清单。
+>
+> 两者冲突时**以对接手册为准**。
+
 ### 帧格式
 
 ```
@@ -209,7 +214,7 @@ USE_STDPERIPH_DRIVER, STM32F10X_MD
  1      1     TYPE       0x01=CMD  0x02=ACK  0x03=EVT
  2      2     SEQ        小端
  4      1     OP
- 5      1     LEN        载荷长度 0~64
+ 5      1     LEN        载荷长度 0~200
  6      LEN   PAYLOAD
  6+LEN   2     CRC16      小端，覆盖 SOF..PAYLOAD
 ```
@@ -218,13 +223,16 @@ USE_STDPERIPH_DRIVER, STM32F10X_MD
 - 校验向量：`"123456789"` → `0x29B1`
 - 拆帧：逐字节状态机，靠 SOF + CRC 重同步，坏帧不阻塞后续
 - 半帧保护：字节间隔 > 100 ms 则丢弃半帧
+- **应答有两种风格**：普通命令回 `0x81/0x82`；
+  查询类命令（PING / GET_CONFIG / STEPPER_STAT / LINK_STAT）
+  **回显请求的 OP**。所以匹配应答要看 `SEQ`，不能只看 `OP == 0x81`。
 
 ### 操作码
 
 | OP | 名称 | 方向 | 说明 |
 |---|---|---|---|
 | 0x01 | MOVE | CMD | `dir(1) + speed(1) + steps(2)` |
-| 0x02 | SERVO | CMD | 角度 + 可选时长 |
+| 0x02 | SERVO | CMD | `deg(int8) + ms(2 LE)`，**固定 3 字节** |
 | 0x03 | TTS | CMD | **TW-TTS 帧透传**（`0xFD` 开头原样转发；否则当 UTF-8 正文自动组帧） |
 | 0x04 | TOF_CFG | CMD | `poll_ms(1)` 运行时调整轮询间隔 |
 | 0x05 | CLEAR_FAULT | CMD | 清故障 |
@@ -256,14 +264,17 @@ USE_STDPERIPH_DRIVER, STM32F10X_MD
 
 ### 状态码
 
-| 值 | 名称 |
-|---|---|
-| 0x00 | OK |
-| 0x02 | BUSY |
-| 0x03 | FAULT_LATCHED |
-| 0x04 | CRC_ERROR |
-| 0x05 | UNKNOWN_OP |
-| 0x07 | FLASH_FAIL |
+| 值 | 名称 | 备注 |
+|---|---|---|
+| 0x00 | OK | |
+| 0x01 | CLAMPED | 参数越界已钳位，仍然是 ACK |
+| 0x02 | BUSY | |
+| 0x03 | FAULT_LATCHED | `detail` 含义有歧义，见对接手册 §5.1 |
+| 0x04 | CRC_ERROR | **固件从不返回**，坏帧静默丢弃 |
+| 0x05 | UNKNOWN_OP | 参数错也用它 |
+| 0x06 | FEATURE_DISABLED | 功能被配置关闭 |
+| 0x07 | FLASH_FAIL | |
+| 0x09 | ARBITRATION | 控制权不在本通道 |
 
 ### 故障码
 
