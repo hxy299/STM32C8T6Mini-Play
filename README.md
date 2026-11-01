@@ -34,8 +34,9 @@
 | 配置 | Flash page 63 持久化，含 CRC 与版本号 | ✅ |
 | 舵机 | PA0 / TIM2_CH1，50 Hz，±45° 缓动 | ✅ |
 | 步进 ×2 | 28BYJ-48 + ULN2003，履带差速 | ✅ |
-| TOF ×4 | VL53L0X 桌沿 / 障碍检测 | 待实现 |
-| TTS | 串口转发 | 待实现（已下放到 MCU 规划） |
+| **TOF ×2** | **VL53L0X：底部前测桌沿 + 前脸测障碍（代码支持 4 颗，当前装 2 颗）** | **✅ 代码完成** |
+| **蓝牙遥控** | **USART3 PB10/PB11，A7Z 不在场时可独立控制** | **✅ 代码完成** |
+| **TTS 转发** | **USART2 PA2/PA3，9600 8N1，TW-TTS 帧中断发送** | **✅ 代码完成** |
 
 **这是一个"执行器从机"**：不自己做决策，只接受上位机的 `MOVE` / `SERVO` 等命令，
 并在超时、过热、故障时自主进入安全状态。
@@ -79,10 +80,12 @@
 |---|---|---|
 | 舵机 | PA0 | TIM2_CH1，50 Hz |
 | 上位机 UART | PA9 / PA10 | USART1，115200 8N1 |
-| TTS 模块 | PA2 / PA3 | USART2 |
-| 蓝牙（预留） | PB10 / PB11 | USART3 |
-| I²C1（TOF） | PB6 / PB7 | 待接入 |
-| TOF XSHUT ×4 | PA4 / PA5 / PA8 / PB5 | 必须互相独立 |
+| TTS 模块 | PA2 / PA3 | USART2，**9600** 8N1，中断发送 |
+| **蓝牙遥控** | **PB10 / PB11** | USART3，115200（模块需先改波特率） |
+| I²C1（TOF） | **PB6 / PB7** | 100 kHz，多颗共用一条总线 |
+| TOF0 XSHUT（底部前） | **PA4** | 10 kΩ 下拉，**当前已装** |
+| TOF3 XSHUT（前脸） | **PA8** | 10 kΩ 下拉，**当前已装** |
+| TOF1 / TOF2 XSHUT | PA5 / PB5 | 预留（底部左/右，**当前未装**） |
 | 按键 | PA1 | 上拉输入 |
 | 心跳 LED | PC13 | 低电平点亮 |
 | SWD | PA13 / PA14 | 调试下载 |
@@ -112,25 +115,43 @@
 ├── BSP/                   板级支持：NVIC / LED / IWDG / 1ms 时基
 ├── System/                Delay（SysTick 微秒/毫秒延时）
 ├── Hardware/
-│   ├── serial.c           USART1 + 接收环形缓冲
+│   ├── serial.c           USART1(A7Z) + USART3(蓝牙) 双端口环形缓冲
 │   ├── servo.c            舵机 PWM + 缓动
 │   ├── servo_math.h       纯函数（可在 PC 上单测）
 │   ├── stepper.c          步进驱动 + 梯形加减速 + 热保护
 │   ├── stepper.h
-│   └── stepper_math.h     纯函数：相序 / Hz→ARR / 减速步数
+│   ├── stepper_math.h     纯函数：相序 / Hz→ARR / 减速步数
+│   ├── i2c1.c             I²C1 主机（阻塞 + 超时 + 总线恢复）
+│   ├── tof.c              VL53L0X ×4（XSHUT 逐颗改址 / 非阻塞轮询）
+│   ├── tof_math.h         纯函数：桌沿 / 障碍判定与回滞
+│   ├── tts.c              ★ USART2 TW-TTS 转发（中断发送）
+│   ├── tts.h
+│   └── tts_math.h         纯函数：环形缓冲 / 帧长 / 原始帧识别
 ├── Protocol/
-│   ├── link_proto.c       组帧 / 拆帧状态机 + CRC16
+│   ├── link_proto.c       组帧 / 拆帧状态机 + CRC16（可实例化）
 │   └── link_proto.h
 ├── Service/
 │   ├── config.c           Flash 配置持久化
+│   ├── cmd_router.h       纯函数：双命令源仲裁与优先级分类
+│   ├── tof_service.c      TOF 轮询调度 / 故障联动 / 自动回退
 │   └── link_service.c     命令分发 / 心跳 / 故障上报
 ├── Start/                 CMSIS + startup + 标准外设库入口
 ├── Library/               ST 标准外设库 V3.5.0
 ├── docs/                  各阶段验收说明
+│   ├── M0-M2.5_验收说明.md
+│   ├── M3_舵机验收说明.md
+│   ├── M4-M5_步进验收说明.md
+│   ├── M6-M7_TOF验收说明.md
+│   ├── M9_TTS转发验收说明.md
+│   ├── TOF两传感器配置说明.md
+│   └── 蓝牙遥控与双源仲裁.md
 └── tools/
     ├── pc_link_test.py    ★ PC 端交互测试工具
     ├── selftest_pc_tool.py
-    ├── check_source_sanity.py
+    ├── check_source_sanity.py   源码卫生（转义残留 / BOM / 换行）
+    ├── run_host_tests.sh        ★ 一条命令跑全部主机单测
+    ├── check_firmware_syntax.sh ★ Keil 之前先做语法筛查
+    ├── stub/stm32f10x.h         最小 SPL 桩（给上面那个用）
     └── hosttest/          纯 C 主机单元测试（在 PC 上跑）
 ```
 
@@ -204,8 +225,8 @@ USE_STDPERIPH_DRIVER, STM32F10X_MD
 |---|---|---|---|
 | 0x01 | MOVE | CMD | `dir(1) + speed(1) + steps(2)` |
 | 0x02 | SERVO | CMD | 角度 + 可选时长 |
-| 0x03 | TTS | CMD | 文本（待实现） |
-| 0x04 | TOF_CFG | CMD | 待实现 |
+| 0x03 | TTS | CMD | **TW-TTS 帧透传**（`0xFD` 开头原样转发；否则当 UTF-8 正文自动组帧） |
+| 0x04 | TOF_CFG | CMD | `poll_ms(1)` 运行时调整轮询间隔 |
 | 0x05 | CLEAR_FAULT | CMD | 清故障 |
 | 0x06 | PING | CMD | 心跳 |
 | 0x07 | SET_CONFIG | CMD | 写 32 位配置字 |
@@ -217,7 +238,10 @@ USE_STDPERIPH_DRIVER, STM32F10X_MD
 | 0x81 | ACK | 回 | `status(1) [+ 附加数据]` |
 | 0x82 | NAK | 回 | `status(1) + op(1)` |
 | 0x86 | PONG | 回 | `uptime(4) + fault(1) + config(4) + flags(1) + impl(1)` |
+| 0x91 | EVT_EDGE_DETECTED | 上报 | `sensor(1) + dist_mm(2)` 桌沿 |
+| 0x92 | EVT_TOF_DATA | 上报 | `mask(1) + d0..d3(2 each)` 周期距离 |
 | 0x93 | EVT_FAULT | 上报 | `fault(1)` |
+| 0x95 | EVT_OBSTACLE_DETECTED | 上报 | `dist_mm(2)` 障碍 |
 | 0x94 | EVT_MOTION_DONE | 上报 | `motor(1) + position(4)` |
 
 ### MOVE 方向
@@ -290,6 +314,8 @@ python tools/pc_link_test.py COM7
 | `sst` | 读电机实时状态 |
 | `lstat` | 读链路健康计数器 |
 | `tick` | 测量 1 ms 时基是否准确（10 秒） |
+| `tof <ms>` | 设置 TOF 轮询间隔（10..255） |
+| `tofd [秒]` | 监听 TOF，实时打印四路距离 |
 | `end [次数] [步数]` | 耐久测试，逐轮核对位置 |
 | `c [ack]` | 清除故障 |
 | `hb` | 500 ms 心跳 |
@@ -312,10 +338,17 @@ python tools/pc_link_test.py COM7 --dcal
 
 ### 主机单元测试（不需要硬件，在 PC 上跑）
 
+一条命令跑全部：
+
 ```bash
-cd tools/hosttest
-gcc -std=c99 -Wall -Wextra -Werror -O2 -I . -I ../../Hardware \
-    test_stepper_math.c -o t && ./t
+bash tools/run_host_tests.sh
+```
+
+也可以单独跑某一个（以 TTS 为例）：
+
+```bash
+gcc -std=c99 -Wall -Wextra -Werror -O2 -I tools/hosttest -I Hardware -I User \
+    tools/hosttest/test_tts_math.c -o t && ./t
 ```
 
 | 测试 | 断言数 | 内容 |
@@ -323,6 +356,22 @@ gcc -std=c99 -Wall -Wextra -Werror -O2 -I . -I ../../Hardware \
 | `test_link_proto.c` | 30 | CRC 向量、组帧、拆帧、坏帧重同步 |
 | `test_servo_math.c` | 17 | 角度钳位、角度→脉宽 |
 | `test_stepper_math.c` | 35 | 相序、Hz→ARR、减速步数、梯形运动模拟 |
+| `test_tof_math.c` | 39 | 桌沿/障碍判定、回滞、去抖、无回波语义 |
+| `test_cmd_router.c` | 43 | 双命令源仲裁、优先级分类、控制权切换 |
+| **`test_tts_math.c`** | **34** | **环形缓冲回绕、整帧原子性、帧长、原始帧识别** |
+| **合计** | **198** | |
+
+### 固件语法检查（打开 Keil 之前跑）
+
+```bash
+bash tools/check_firmware_syntax.sh
+```
+
+用 `tools/stub/stm32f10x.h` 这个最小 SPL 桩，在 PC 上对 13 个固件源文件做
+`-fsyntax-only`。能挡掉拼写错误、漏分号、结构体字段写错、函数未声明。
+
+> ⚠️ **它不等价于 Keil 编译。** 不产生目标码、不检查链接、不验证外设行为。
+> 真正上板前仍必须在 Keil 里 Build 一次。
 
 ### 源码卫生检查（编译前必跑）
 
@@ -370,10 +419,11 @@ python tools/check_source_sanity.py
 | M3 | 舵机 | ✅ |
 | M4 | 单电机精确步数 | ✅ |
 | M5 | 双履带差速 | ✅ |
-| M6 / M7 | VL53L0X + 桌沿检测 | ⬜ 进行中 |
-| M8 | 前脸障碍检测 | ⬜ |
+| **M6** | **VL53L0X I²C 驱动 + 4 颗 XSHUT 地址分配** | **✅ 代码完成** |
+| **M7** | **底部 3 颗桌沿检测（距离变远 = 危险）** | **✅ 代码完成** |
+| M8 | 前脸障碍检测（距离变近 = 危险） | ✅ 逻辑已实现，待阈值标定 |
 | M8.8 | 盲走模式 + 失联保护 | ⬜ |
-| M9 | TTS 转发 | ⬜ |
+| **M9** | **TTS 转发（USART2 / 9600 / 中断发送）** | **✅ 代码完成** |
 | M10 | A7Z ↔ MCU 整机联调 | ⬜ |
 | M11 | 失效安全验收 | ⬜ |
 | M12 | 长跑测试 | ⬜ |

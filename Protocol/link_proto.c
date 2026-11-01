@@ -2,20 +2,15 @@
   ******************************************************************************
   * @file    Protocol/link_proto.c
   * @brief   帧组包 / 拆包 / CRC16-CCITT-FALSE
+  *
+  * M6/M7 起拆帧状态机改为【实例化】：
+  *   USART1（A7Z）和 USART3（蓝牙）各持有一个 link_parser_t，
+  *   互不干扰。老的单例 API 保留为一层薄封装，指向默认实例。
   ******************************************************************************
   */
 #include <string.h>
 #include "app_config.h"
 #include "link_proto.h"
-
-/* ============================ 统计 ============================ */
-static uint32_t s_good = 0u;
-static uint32_t s_bad = 0u;
-static uint32_t s_drop = 0u;
-
-uint32_t Link_GetGoodFrames(void) { return s_good; }
-uint32_t Link_GetBadFrames(void)  { return s_bad;  }
-uint32_t Link_GetByteDrops(void)  { return s_drop; }
 
 /* ============================ CRC16-CCITT-FALSE ============================ */
 /* 多项式 0x1021，初值 0xFFFF，输入/输出均不反转，无最终异或。
@@ -106,151 +101,172 @@ typedef enum
     ST_CRC_H
 } parse_state_t;
 
-static parse_state_t s_state = ST_SOF;
-static link_frame_t  s_acc;                       /* 累积中的帧 */
-static uint8_t       s_raw[LINK_MAX_FRAME];       /* 原始字节镜像（用于 CRC）*/
-static uint16_t      s_raw_len = 0u;
-static uint8_t       s_idx = 0u;                  /* payload 写入下标 */
-static uint16_t      s_crc_rx = 0u;
-static uint32_t      s_last_byte_ms = 0u;
-static uint8_t       s_have_last = 0u;
-static uint32_t      s_timeout_drops = 0u;
-
-/* 半帧超时保护：见 app_config.h 的 LINK_INTERBYTE_TIMEOUT_MS 说明 */
-uint32_t Link_GetTimeoutDrops(void)
+void Link_ParserInit(link_parser_t *p)
 {
-    return s_timeout_drops;
-}
-
-void Link_ParserReset(void)
-{
-    s_state = ST_SOF;
-    s_idx = 0u;
-    s_raw_len = 0u;
-    s_crc_rx = 0u;
-    memset(&s_acc, 0, sizeof(s_acc));
+    if (p == 0)
+    {
+        return;
+    }
+    memset(p, 0, sizeof(*p));
+    p->state = (uint8_t)ST_SOF;
 }
 
 /* 把已接受的字节追加进原始镜像（不含 CRC 两字节）*/
-static void raw_push(uint8_t b)
+static void raw_push(link_parser_t *p, uint8_t b)
 {
-    if (s_raw_len < (uint16_t)sizeof(s_raw))
+    if (p->raw_len < (uint16_t)sizeof(p->raw))
     {
-        s_raw[s_raw_len++] = b;
+        p->raw[p->raw_len++] = b;
     }
 }
 
-int Link_FeedByte(uint8_t byte, uint32_t now_ms, link_frame_t *out)
+static void parser_reset(link_parser_t *p)
 {
+    p->state     = (uint8_t)ST_SOF;
+    p->idx       = 0u;
+    p->raw_len   = 0u;
+    p->crc_rx    = 0u;
+    memset(&p->acc, 0, sizeof(p->acc));
+}
+
+int Link_FeedByteTo(link_parser_t *p, uint8_t byte,
+                    uint32_t now_ms, link_frame_t *out)
+{
+    if (p == 0)
+    {
+        return -1;
+    }
+
     /* ---- 帧间超时保护 ----
      * 若正在拼帧却已超时，说明之前遇到的是假 SOF（噪声），
      * 立刻丢弃半帧，并把当前字节当作新的起点处理。
      * 这一步能避免"假 SOF + 大 LEN 吞掉紧随其后的真帧"。
+     *
+     * ★ 每个端口有自己的 last_byte_ms，所以在蓝牙端口刷屏时
+     *   不会把 A7Z 侧正在拼的半帧误判超时。
      */
-    if (s_state != ST_SOF && s_have_last &&
-        (uint32_t)(now_ms - s_last_byte_ms) > LINK_INTERBYTE_TIMEOUT_MS)
+    if ((p->state != (uint8_t)ST_SOF) && (p->have_last != 0u) &&
+        ((uint32_t)(now_ms - p->last_byte_ms) > LINK_INTERBYTE_TIMEOUT_MS))
     {
-        s_timeout_drops++;
-        s_bad++;
-        Link_ParserReset();
+        p->timeout_drops++;
+        p->bad++;
+        parser_reset(p);
     }
 
-    s_last_byte_ms = now_ms;
-    s_have_last = 1u;
+    p->last_byte_ms = now_ms;
+    p->have_last = 1u;
 
-    switch (s_state)
+    switch ((parse_state_t)p->state)
     {
     case ST_SOF:
         if (byte == LINK_SOF)
         {
-            Link_ParserReset();
-            raw_push(byte);
-            s_state = ST_TYPE;
+            parser_reset(p);
+            raw_push(p, byte);
+            p->state = (uint8_t)ST_TYPE;
         }
         /* 非 SOF：正常的重同步过程，不计入统计 */
         return 0;
 
     case ST_TYPE:
-        s_acc.type = byte;
-        raw_push(byte);
-        s_state = ST_SEQ_L;
+        p->acc.type = byte;
+        raw_push(p, byte);
+        p->state = (uint8_t)ST_SEQ_L;
         return 0;
 
     case ST_SEQ_L:
-        s_acc.seq = byte;
-        raw_push(byte);
-        s_state = ST_SEQ_H;
+        p->acc.seq = byte;
+        raw_push(p, byte);
+        p->state = (uint8_t)ST_SEQ_H;
         return 0;
 
     case ST_SEQ_H:
-        s_acc.seq = (uint16_t)(s_acc.seq | ((uint16_t)byte << 8));
-        raw_push(byte);
-        s_state = ST_OP;
+        p->acc.seq = (uint16_t)(p->acc.seq | ((uint16_t)byte << 8));
+        raw_push(p, byte);
+        p->state = (uint8_t)ST_OP;
         return 0;
 
     case ST_OP:
-        s_acc.op = byte;
-        raw_push(byte);
-        s_state = ST_LEN;
+        p->acc.op = byte;
+        raw_push(p, byte);
+        p->state = (uint8_t)ST_LEN;
         return 0;
 
     case ST_LEN:
         if (byte > LINK_MAX_PAYLOAD)
         {
-            s_bad++;
-            s_drop++;
-            Link_ParserReset();
+            p->bad++;
+            p->drop++;
+            parser_reset(p);
             return -1;
         }
-        s_acc.len = byte;
-        s_idx = 0u;
-        raw_push(byte);
-        s_state = (byte == 0u) ? ST_CRC_L : ST_PAYLOAD;
+        p->acc.len = byte;
+        p->idx = 0u;
+        raw_push(p, byte);
+        p->state = (byte == 0u) ? (uint8_t)ST_CRC_L : (uint8_t)ST_PAYLOAD;
         return 0;
 
     case ST_PAYLOAD:
-        if (s_idx < LINK_MAX_PAYLOAD)
+        if (p->idx < LINK_MAX_PAYLOAD)
         {
-            s_acc.payload[s_idx] = byte;
+            p->acc.payload[p->idx] = byte;
         }
-        raw_push(byte);
-        s_idx++;
-        if (s_idx >= s_acc.len)
+        raw_push(p, byte);
+        p->idx++;
+        if (p->idx >= p->acc.len)
         {
-            s_state = ST_CRC_L;
+            p->state = (uint8_t)ST_CRC_L;
         }
         return 0;
 
     case ST_CRC_L:
-        s_crc_rx = byte;
-        s_state = ST_CRC_H;
+        p->crc_rx = byte;
+        p->state = (uint8_t)ST_CRC_H;
         return 0;
 
     case ST_CRC_H:
     {
         uint16_t crc_calc;
 
-        s_crc_rx = (uint16_t)(s_crc_rx | ((uint16_t)byte << 8));
-        crc_calc = Link_Crc16(s_raw, s_raw_len);
+        p->crc_rx = (uint16_t)(p->crc_rx | ((uint16_t)byte << 8));
+        crc_calc = Link_Crc16(p->raw, p->raw_len);
 
-        if (crc_calc != s_crc_rx)
+        if (crc_calc != p->crc_rx)
         {
-            s_bad++;
-            Link_ParserReset();
+            p->bad++;
+            parser_reset(p);
             return -1;
         }
 
         if (out != 0)
         {
-            *out = s_acc;
+            *out = p->acc;
         }
-        s_good++;
-        Link_ParserReset();
+        p->good++;
+        parser_reset(p);
         return 1;
     }
 
     default:
-        Link_ParserReset();
+        parser_reset(p);
         return -1;
     }
 }
+
+/* ============================ 兼容用：默认实例 ============================ */
+static link_parser_t s_default;
+
+void Link_ParserReset(void)
+{
+    parser_reset(&s_default);
+}
+
+int Link_FeedByte(uint8_t byte, uint32_t now_ms, link_frame_t *out)
+{
+    return Link_FeedByteTo(&s_default, byte, now_ms, out);
+}
+
+uint32_t Link_GetTimeoutDrops(void) { return s_default.timeout_drops; }
+uint32_t Link_GetGoodFrames(void)   { return s_default.good; }
+uint32_t Link_GetBadFrames(void)    { return s_default.bad; }
+uint32_t Link_GetByteDrops(void)    { return s_default.drop; }

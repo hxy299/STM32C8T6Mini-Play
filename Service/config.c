@@ -206,6 +206,22 @@ uint8_t Config_IsBottomTofAllDisabled(void)
     return ((s_config & CFG_BOTTOM_TOF_MASK) == 0u) ? 1u : 0u;
 }
 
+/**
+  * @brief  启用了几颗底部桌沿传感器（0..3）
+  * @note   用于区分"完整覆盖"和"只有前向一颗"：
+  *         只有一颗时，后退方向完全没有保护。
+  */
+uint8_t Config_GetBottomTofCount(void)
+{
+    uint8_t n = 0u;
+
+    if ((s_config & CFG_TOF0_EN) != 0u) { n++; }
+    if ((s_config & CFG_TOF1_EN) != 0u) { n++; }
+    if ((s_config & CFG_TOF2_EN) != 0u) { n++; }
+
+    return n;
+}
+
 uint32_t Config_GetFlashWriteCount(void)
 {
     return s_write_count;

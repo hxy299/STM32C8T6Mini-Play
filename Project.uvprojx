@@ -710,6 +710,21 @@
               <FileType>1</FileType>
               <FilePath>.\Hardware\stepper.c</FilePath>
             </File>
+            <File>
+              <FileName>i2c1.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\i2c1.c</FilePath>
+            </File>
+            <File>
+              <FileName>tof.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\tof.c</FilePath>
+            </File>
+            <File>
+              <FileName>tts.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\tts.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -734,6 +749,11 @@
               <FileName>link_service.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\Service\link_service.c</FilePath>
+            </File>
+            <File>
+              <FileName>tof_service.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Service\tof_service.c</FilePath>
             </File>
           </Files>
         </Group>

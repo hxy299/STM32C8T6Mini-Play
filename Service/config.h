@@ -31,6 +31,7 @@ uint32_t Config_Get(void);
 uint8_t  Config_IsEnabled(uint32_t mask);
 uint8_t  Config_IsDefault(void);
 uint8_t  Config_IsBottomTofAllDisabled(void);   /* 触发盲走模式的判据 */
+uint8_t  Config_GetBottomTofCount(void);        /* 启用的桌沿传感器数量 0..3 */
 
 /* ---------- 修改 ----------
  * 返回 CONFIG_OK 或 CONFIG_ERR_FLASH。

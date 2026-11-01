@@ -59,6 +59,12 @@ OP_MOTOR_STOP = 0x0C
 OP_ACK, OP_NAK, OP_PONG, OP_CONFIG = 0x81, 0x82, 0x86, 0x87
 OP_EVT_FAULT, OP_EVT_CONFIG_CHANGED = 0x93, 0x96
 OP_EVT_MOTION_DONE = 0x94
+OP_EVT_EDGE_DETECTED = 0x91
+OP_EVT_TOF_DATA = 0x92
+OP_EVT_OBSTACLE_DETECTED = 0x95
+
+# 0x09 = 当前控制权不在本通道（另一路在控制）
+ST_ARBITRATION = 0x09
 
 STATUS = {
     0x00: "OK",
@@ -70,6 +76,7 @@ STATUS = {
     0x06: "FEATURE_DISABLED",
     0x07: "FLASH_FAIL",
     0x08: "NOT_IMPLEMENTED",
+    0x09: "ARBITRATION",      # 控制权不在本通道
 }
 
 OPNAME = {
@@ -83,6 +90,9 @@ OPNAME = {
     OP_ACK: "ACK", OP_NAK: "NAK", OP_PONG: "PONG", OP_CONFIG: "CONFIG",
     OP_EVT_FAULT: "EVT_FAULT", OP_EVT_CONFIG_CHANGED: "EVT_CONFIG_CHANGED",
     OP_EVT_MOTION_DONE: "MOTION_DONE",
+    OP_EVT_EDGE_DETECTED: "EDGE_DETECTED",
+    OP_EVT_TOF_DATA: "TOF_DATA",
+    OP_EVT_OBSTACLE_DETECTED: "OBSTACLE_DETECTED",
 }
 
 FAULT = {
@@ -225,6 +235,21 @@ def describe(f: dict) -> str:
         motor = "L" if p[0] == 0 else "R"
         pos = struct.unpack("<i", p[1:5])[0]
         parts.append("motor=%s position=%d" % (motor, pos))
+    elif op == OP_EVT_EDGE_DETECTED and len(p) >= 3:
+        # 桌沿事件：sensor(1) + dist_mm(2)
+        mm = struct.unpack(">H", p[1:3])[0]
+        parts.append("TOF%d 桌沿! dist=%d mm" % (p[0], mm))
+    elif op == OP_EVT_OBSTACLE_DETECTED and len(p) >= 2:
+        mm = struct.unpack(">H", p[0:2])[0]
+        parts.append("障碍! dist=%d mm" % mm)
+    elif op == OP_EVT_TOF_DATA and len(p) >= 9:
+        mask = p[0]
+        vals = []
+        for i in range(4):
+            v = struct.unpack(">H", p[1 + i * 2:3 + i * 2])[0]
+            if (mask >> i) & 1:
+                vals.append("T%d=%s" % (i, "----" if v == 0xFFFF else "%dmm" % v))
+        parts.append(" ".join(vals))
     elif p:
         parts.append("payload=" + p.hex(" "))
     return "  ".join(parts)
@@ -1089,7 +1114,227 @@ def ask_link_stat(link: Link) -> bool:
         print("  距上一帧      : %d ms" % age)
     print("  fault         : 0x%02X(%s)   comm_lost=%d"
           % (fault, FAULT.get(fault, "?"), lost))
+
+    # 双链路状态（固件 32 字节版本才有）
+    if len(p) >= 32:
+        owner = p[26]
+        a7z_alive = p[27]
+        bt_alive = p[28]
+        bt_ready = p[29]
+        owner_s = {0: "A7Z", 1: "蓝牙", 0xFF: "无人"}.get(owner, "0x%02X" % owner)
+        print("  ---- 双链路 ----")
+        print("  控制权        : %s" % owner_s)
+        print("  A7Z  在线     : %s" % ("YES" if a7z_alive else "no"))
+        print("  蓝牙 在线     : %s" % ("YES" if bt_alive else "no"))
+        print("  蓝牙 已初始化 : %s" % ("YES" if bt_ready else "no（CFG_BT_EN=0 或未接线）"))
+    else:
+        print("  （固件是旧版本，无蓝牙状态；需 Rebuild）")
     return True
+
+
+def ask_tof_cfg(link: Link, ms: int) -> bool:
+    """设置 TOF 两颗之间的轮询间隔（10..255 ms）。"""
+    print("\n[TOF_CFG] 轮询间隔 -> %d ms" % ms)
+    link.drain()
+    seq = link.send(TYPE_CMD, OP_TOF_CFG, bytes([max(0, min(255, ms))]))
+    for f in link.recv(1.0):
+        if f["type"] == TYPE_ACK and f["seq"] == seq:
+            if f["op"] == OP_ACK:
+                st = f["payload"][0] if f["payload"] else 0
+                if st == 0:
+                    print("  ✓ ACK(OK)")
+                else:
+                    print("  ! ACK(0x%02X) 参数越界已钳位" % st)
+                return True
+            st = f["payload"][0] if f["payload"] else 0xFF
+            print("  ✗ NAK(0x%02X %s)" % (st, STATUS.get(st, "?")))
+            return False
+    print("  ✗ 未收到应答（固件可能是 M4/M5 版本）")
+    return False
+
+
+def _tts_result(link: Link, seq: int, sent: int) -> bool:
+    """统一解析 TTS 的应答。"""
+    for f in link.recv(1.5):
+        if f["type"] == TYPE_ACK and f["seq"] == seq:
+            st = f["payload"][0] if f["payload"] else 0xFF
+            if f["op"] == OP_ACK:
+                if st == 0:
+                    print("  ✓ ACK(OK) 已入发送队列（%d 字节）" % sent)
+                else:
+                    print("  ✓ ACK(0x%02X %s) 已入队，但发送缓冲还有积压"
+                          % (st, STATUS.get(st, "?")))
+                return True
+            detail = f["payload"][1] if len(f["payload"]) > 1 else 0
+            print("  ✗ NAK(0x%02X %s) op=0x%02X"
+                  % (st, STATUS.get(st, "?"), detail))
+            if st == 0x06:
+                print("      -> CFG_TTS_EN=0 或 TTS_LINK_ENABLE=0，"
+                      "发 s 0000004e 打开后两位")
+            elif st == 0x02:
+                print("      -> 发送缓冲满。9600 波特下每秒只能发 960 字节，"
+                      "请降低语速或等一会儿再发")
+            elif st == 0x01:
+                print("      -> 正文超过 190 字节（约 63 个汉字），拆句再发")
+            return False
+    print("  ✗ 未收到应答（固件可能是 M7 之前版本，或 TTS 未初始化）")
+    return False
+
+
+def ask_tts(link: Link, text: str) -> bool:
+    """发送一段 UTF-8 正文，由 MCU 组 TW-TTS 文本帧。
+
+    这是台架自测最方便的方式：不用自己算帧头，直接发一句中文。
+    """
+    payload = text.encode("utf-8")
+    print("\n[TTS] 正文 %d 字节：%s" % (len(payload), text))
+    if len(payload) > 190:
+        print("  ✗ 过长（>190 字节），MCU 会拒绝。请拆成两句")
+        return False
+    # 粗估播放时长：9600 8N1 = 960 字节/秒，外加模块合成时间
+    print("  预计串口占用 %.0f ms（960 字节/秒）" % (len(payload) / 960.0 * 1000))
+    link.drain()
+    seq = link.send(TYPE_CMD, OP_TTS, payload)
+    return _tts_result(link, seq, len(payload))
+
+
+def ask_tts_raw(link: Link, hexstr: str) -> bool:
+    """发送 TW-TTS 原始帧（十六进制），验证 A7Z 侧真实帧能否透传。
+
+    例：ttsraw fd000601015b76355d     -> 音量设 5
+    """
+    try:
+        payload = bytes.fromhex(hexstr.replace(" ", "").replace(",", ""))
+    except ValueError:
+        print("  ✗ 十六进制格式不对，例：fd 00 06 01 01 5b 76 35 5d")
+        return False
+    if not payload:
+        print("  ✗ 空帧")
+        return False
+    if payload[0] != 0xFD:
+        print("  ! 首字节不是 0xFD，MCU 会把它当 UTF-8 正文处理")
+    print("\n[TTS-RAW] %d 字节：%s" % (len(payload), payload.hex(" ")))
+    link.drain()
+    seq = link.send(TYPE_CMD, OP_TTS, payload)
+    return _tts_result(link, seq, len(payload))
+
+
+def run_tts_demo(link: Link) -> int:
+    """TTS 一键验收：参数帧 -> 短句 -> 长句 -> 超长拒绝。
+
+    设计成一次跑完，是为了让"有没有声音"和"会不会卡主循环"
+    能在同一次操作里同时看到 —— 后者要靠观察心跳是否继续。
+    """
+    print("=" * 68)
+    print(" TTS 验收（USART2 / PA2 / 9600 8N1）")
+    print("=" * 68)
+    print(" 开始前确认：")
+    print("   1) TTS 模块 VCC 接 5V、GND 共地")
+    print("   2) 模块 RX ← STM32 PA2")
+    print("   3) 配置字 TTS_EN 已打开（s 0000004e）")
+    print()
+
+    ok = 0
+    total = 0
+
+    # ① 三帧参数：音量 5、语速 5、语调 5
+    params = [("音量", "fd000601015b76355d"),
+              ("语速", "fd000601015b73355d"),
+              ("语调", "fd000601015b74355d")]
+    for name, hexs in params:
+        total += 1
+        print("--- ① %s参数帧 ---" % name)
+        if ask_tts_raw(link, hexs):
+            ok += 1
+        time.sleep(0.35)
+
+    # ② 短句
+    total += 1
+    print("--- ② 短句 ---")
+    if ask_tts(link, "你好，我是桌面陪伴宠物"):
+        ok += 1
+    time.sleep(2.0)
+
+    # ③ 中文长句（接近 190 字节上限的 60 个字）
+    total += 1
+    print("--- ③ 长句 ---")
+    long_text = ("我可以看见你，也可以听懂你说话。"
+                 "现在这条语音是从下位机转发出来的，"
+                 "整个过程中主循环没有停下来。")
+    if ask_tts(link, long_text):
+        ok += 1
+    time.sleep(3.5)
+
+    # ④ 超长必须被拒（不应发出去）
+    total += 1
+    print("--- ④ 超长正文应被拒绝 ---")
+    too_long = "啊" * 200
+    if not ask_tts(link, too_long):
+        ok += 1
+        print("  ✓ 正确拒绝")
+    else:
+        print("  ✗ 居然接受了，说明长度校验失效")
+
+    print()
+    print(" 结果: %d/%d" % (ok, total))
+    print(" 还要确认一件事：上面每一步之间【心跳不能断】。")
+    print(" 如果 st 之后能立刻响应，说明 TTS 没有阻塞主循环。")
+    return ok
+
+
+def watch_tof(link: Link, seconds: float = 10.0) -> int:
+    """监听 TOF 事件，实时打印四路距离。
+
+    这是验收桌沿保护最直观的手段：把机器人放到桌边慢慢推，
+    观察 T0/T1/T2 谁先跳变、是否触发 EDGE_DETECTED。
+    """
+    print("=" * 68)
+    print(" TOF 监听 %.0f 秒（Ctrl+C 退出）" % seconds)
+    print(" T0=底部前  T1=底部左  T2=底部右(均测桌沿)  T3=前脸(测障碍)")
+    print(" ---- = 无回波/无效")
+    print("=" * 68)
+
+    link.drain()
+    saved = link.silent_ops
+    # 把 TOF_DATA 也静音，改用自定义的一行式输出
+    link.silent_ops = {OP_PING, OP_PONG, OP_TOF_DATA}
+    t0 = time.monotonic()
+    last_ping = 0.0
+    try:
+        while time.monotonic() - t0 < seconds:
+            if time.monotonic() - last_ping > 0.4:
+                link.send(TYPE_CMD, OP_PING, seq=link.next_seq())
+                last_ping = time.monotonic()
+
+            for fr in link.recv(0.08):
+                p = fr["payload"]
+                if fr["op"] == OP_EVT_TOF_DATA and len(p) >= 9:
+                    mask = p[0]
+                    cells = []
+                    for i in range(4):
+                        v = struct.unpack(">H", p[1 + i * 2:3 + i * 2])[0]
+                        if not ((mask >> i) & 1):
+                            cells.append("T%d = --off--" % i)
+                        elif v == 0xFFFF:
+                            cells.append("T%d =   ----" % i)
+                        else:
+                            cells.append("T%d = %4d mm" % (i, v))
+                    print("  " + "   ".join(cells))
+                elif fr["op"] == OP_EVT_EDGE_DETECTED and len(p) >= 3:
+                    mm = struct.unpack(">H", p[1:3])[0]
+                    print("  >>> 桌沿触发！ TOF%d  dist=%d mm" % (p[0], mm))
+                elif fr["op"] == OP_EVT_OBSTACLE_DETECTED and len(p) >= 2:
+                    mm = struct.unpack(">H", p[0:2])[0]
+                    print("  >>> 障碍触发！ dist=%d mm" % mm)
+                elif fr["op"] == OP_EVT_FAULT and len(p) >= 1:
+                    print("  [FAULT] 0x%02X(%s)" % (p[0], FAULT.get(p[0], "?")))
+    except KeyboardInterrupt:
+        print("\n  (已中断)")
+    finally:
+        link.silent_ops = saved
+
+    print("=" * 68)
+    return 0
 
 
 def read_stepper_stat(link: Link):
@@ -1304,11 +1549,15 @@ def repl(link: Link):
     print("  lstat                   读回链路健康计数器（诊断丢帧/心跳）")
     print("  tick                    测量 1ms 时基是否准确（10 秒）")
     print("  cal                     方向标定：依次跑 fwd/bck/lft/rgt")
+    print("  tof <ms>                设置 TOF 轮询间隔（10..255）")
+    print("  tofd [秒数]             监听 TOF，实时打印四路距离（默认 10 秒）")
     print("  dcal                    方向标定（单侧驱动，最可靠，推荐）")
     print("  ml <steps>              只驱动左电机（原始方向，有符号）")
     print("  mr <steps>              只驱动右电机（原始方向，有符号）")
     print("  c [ack]           CLEAR_FAULT")
-    print("  t <text>          TTS 原样转发（当前阶段返回 NAK）")
+    print("  tts <text>        TTS 发一句中文（MCU 自动组 TW-TTS 帧）")
+    print("  ttsraw <hex>      TTS 发原始 TW-TTS 帧，如 fd000601015b76355d")
+    print("  ttsdemo           TTS 一键验收（参数帧 + 短句 + 长句 + 超长拒绝）")
     print("  raw <hex...>      直接发原始字节")
     print("  hb               开始 500ms 心跳（Ctrl+C 退出）")
     print("  q                 退出")
@@ -1364,6 +1613,10 @@ def repl(link: Link):
                 run_tick_test(link)
             elif cmd == "cal":
                 run_calibration(link)
+            elif cmd == "tof" and len(parts) >= 2:
+                ask_tof_cfg(link, int(parts[1]))
+            elif cmd == "tofd":
+                watch_tof(link, float(parts[1]) if len(parts) >= 2 else 10.0)
             elif cmd == "dcal":
                 run_dir_calibration(link)
             elif cmd == "ml" and len(parts) >= 2:
@@ -1379,9 +1632,13 @@ def repl(link: Link):
             elif cmd == "c":
                 ask_clear_fault(link, ack=(len(parts) > 1 and parts[1] == "ack"))
             elif cmd == "t" and len(parts) >= 2:
-                text = " ".join(parts[1:]).encode("utf-8")
-                seq = link.send(TYPE_CMD, OP_TTS, text)
-                link.recv(1.0)
+                ask_tts(link, " ".join(parts[1:]))
+            elif cmd == "tts" and len(parts) >= 2:
+                ask_tts(link, " ".join(parts[1:]))
+            elif cmd == "ttsraw" and len(parts) >= 2:
+                ask_tts_raw(link, "".join(parts[1:]))
+            elif cmd == "ttsdemo":
+                run_tts_demo(link)
             elif cmd == "hb":
                 print("心跳中，Ctrl+C 停止")
                 try:
@@ -1491,6 +1748,8 @@ def main():
     ap.add_argument("--ping", action="store_true", help="只发一次 PING")
     ap.add_argument("--dcal", action="store_true",
                     help="方向标定：单侧驱动（最可靠）")
+    ap.add_argument("--tofd", type=float, default=0, metavar="SEC",
+                    help="监听 TOF 事件并打印距离")
     ap.add_argument("--cal", action="store_true",
                     help="方向标定：依次跑四个方向")
     ap.add_argument("--tick-test", action="store_true",
@@ -1520,6 +1779,8 @@ def main():
             sys.exit(0 if run_move_selftest(link) == 0 else 1)
         elif args.dcal:
             sys.exit(run_dir_calibration(link))
+        elif args.tofd:
+            sys.exit(watch_tof(link, args.tofd))
         elif args.cal:
             sys.exit(run_calibration(link))
         elif args.tick_test:

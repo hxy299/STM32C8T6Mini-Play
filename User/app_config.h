@@ -24,6 +24,93 @@
 #define LINK_USART_IRQn         USART1_IRQn
 #define LINK_RX_RING_SIZE       256u    /* 2 的幂，中断写入 */
 
+/* ============================ 蓝牙链路（USART3）============================
+ * 目的：A7Z 不在场时，STM32 仍能被蓝牙遥控独立操作。
+ *
+ * 引脚：PB10 = USART3_TX → 模块 RX
+ *       PB11 = USART3_RX ← 模块 TX
+ *       两者都是 USART3 的默认引脚，无需重映射。
+ *
+ * ⚠️ 波特率：HC-05 / HC-06 出厂默认 9600，必须先用 AT 命令改到 115200：
+ *      AT+UART=115200,0,0
+ *    原因：9600 下发送一个 20 字节应答帧要 20 ms 阻塞，
+ *    这是双链路场景下"程序卡死"最直接的来源。
+ */
+#define BT_LINK_ENABLE          1
+#define BT_USART                USART3
+#define BT_USART_CLK            RCC_APB1Periph_USART3
+#define BT_USART_IRQn           USART3_IRQn
+#define BT_GPIO_PORT            GPIOB
+#define BT_GPIO_CLK             RCC_APB2Periph_GPIOB
+#define BT_TX_PIN               GPIO_Pin_10
+#define BT_RX_PIN               GPIO_Pin_11
+
+/* 115200：一个 20 字节应答帧约 1.7 ms 阻塞发送，可接受。
+ * 若模块改不了、被迫用 9600，必须保持 BT_VERBOSE_EVENTS = 0。 */
+#define BT_UART_BAUDRATE        115200u
+#define BT_RX_RING_SIZE         128u    /* 2 的幂 */
+
+/* 蓝牙多久没有有效帧就算"失联"（释放控制权）。
+ * 比 A7Z 的 1000 ms 宽松：蓝牙是人工遥控，节奏比机器慢。 */
+#define BT_TIMEOUT_MS           2000u
+
+/* 是否给蓝牙端口发高频事件（TOF_DATA 每 200 ms 一条）。
+ * 0 = 不发。蓝牙只是遥控通道，不需要遥测流；
+ *     而且低波特率下这条流会把发送端堵死。 */
+#define BT_VERBOSE_EVENTS       0
+
+/* ============================ M9：TTS 语音模块（USART2）============================
+ * 架构（说明书 §1.1「TTS 帧转发」）：
+ *   A7Z 的 UART4 已经完全交给运动链路，TTS 模块改挂到 STM32 上，
+ *   A7Z 只把 TW-TTS 原始帧塞进 OP_TTS 的负载，由 MCU 原样转发。
+ *
+ * 引脚：PA2 = USART2_TX → 模块 RX
+ *       PA3 = USART2_RX ← 模块 TX（模块通常不回数据，留着以便以后读状态）
+ *
+ * ★ 9600 8N1 是 TW-TTS 模块的固定波特率，只有 960 字节/秒。
+ *   一条 60 字的中文句 ≈ 190 字节 ≈ 200 ms 发完。
+ *
+ *   ⚠️ 所以【绝对不能同步发送】。同步发一帧就把 1 ms 步进节拍和心跳
+ *      全卡住 200 ms，直接违反说明书 §1.2 原则 4「MCU 不阻塞」。
+ *      本模块用 TX 环形缓冲 + 中断发送，Relay 只做入队（微秒级）。
+ */
+#define TTS_LINK_ENABLE         1
+#define TTS_USART               USART2
+#define TTS_USART_CLK           RCC_APB1Periph_USART2
+#define TTS_USART_IRQn          USART2_IRQn
+#define TTS_GPIO_PORT           GPIOA
+#define TTS_GPIO_CLK            RCC_APB2Periph_GPIOA
+#define TTS_TX_PIN              GPIO_Pin_2
+#define TTS_RX_PIN              GPIO_Pin_3
+#define TTS_UART_BAUDRATE       9600u
+
+/* TX 环大小必须 2 的幂。512 字节约等于 2.5 条长句，
+ * 用来吸收 A7Z 分词后连续下发的几句话之间的抖动。 */
+#define TTS_TX_RING_SIZE        512u
+#define TTS_RX_RING_SIZE        64u
+
+/* 单帧上限 = LINK_MAX_PAYLOAD（200）。
+ * TW-TTS 文本帧头 5 字节，因此能承载的 UTF-8 正文最长 195 字节
+ * （约 65 个汉字）。A7Z 侧的 SentenceStream 本来就是按句切的。 */
+#define TTS_FRAME_MAX           200u
+#define TTS_TEXT_MAX            190u    /* 正文上限，留 5 字节头 */
+
+/* 返回码 */
+#define TTS_OK                  0
+#define TTS_ERR_NOTREADY       (-1)
+#define TTS_ERR_TOOLONG        (-2)
+#define TTS_ERR_BUSY           (-3)
+
+/* ============================ 双端口调度预算 ============================
+ * 每个端口每次主循环最多处理多少字节。
+ *
+ * ★ 这是"防止程序卡死"的核心：
+ *   如果蓝牙端口被噪声刷屏，没有配额限制时主循环会一直在这里解析，
+ *   A7Z 处理和步进任务全被饿死 —— 表现就是整机卡住。
+ *   加配额后单个端口再吵也最多吃掉这么多，剩下的留到下一轮。
+ */
+#define LINK_PORT_BYTE_BUDGET   32u
+
 /* ============================ 协议常量 ============================ */
 #define LINK_SOF                0xA5u
 #define LINK_MAX_PAYLOAD        200u
@@ -66,7 +153,8 @@
 #define IMPL_CLEAR_FAULT        (1u << 5)   /* M2.5：CLEAR_FAULT */
 
 /* 当前固件实现的能力集合 */
-#define IMPL_MASK_CURRENT       (IMPL_SERVO | IMPL_MOVE | IMPL_CONFIG | IMPL_CLEAR_FAULT)
+#define IMPL_MASK_CURRENT       (IMPL_SERVO | IMPL_MOVE | IMPL_CONFIG | \
+                                 IMPL_CLEAR_FAULT | IMPL_TOF | IMPL_TTS)
 
 /* MOVE 命令的方向字节 */
 #define MOVE_DIR_FORWARD        0x00u
@@ -86,6 +174,9 @@
 #define OP_EVT_FAULT            0x93u
 #define OP_EVT_CONFIG_CHANGED   0x96u
 #define OP_EVT_MOTION_DONE      0x94u
+#define OP_EVT_EDGE_DETECTED    0x91u   /* M7：桌沿触发  sensor(1) dist_mm(2) */
+#define OP_EVT_TOF_DATA         0x92u   /* M7：周期距离  mask(1) d0..d3(2 each) */
+#define OP_EVT_OBSTACLE_DETECTED 0x95u  /* M8：障碍触发  dist_mm(2) */
 
 /* 状态码 */
 #define ST_OK                   0x00u
@@ -96,6 +187,19 @@
 #define ST_UNKNOWN_OP           0x05u
 #define ST_FEATURE_DISABLED     0x06u
 #define ST_FLASH_FAIL           0x07u
+#define ST_ARBITRATION          0x09u   /* 当前控制权不在本通道（另一路在控制）*/
+
+/* ============================ 命令优先级分类 ============================
+ * 双命令源（A7Z / 蓝牙）仲裁用。分类只看操作码，与来源无关。
+ *
+ *   SAFETY  停止、清故障 —— 任何来源、任何时候都执行，不受控制权限制。
+ *           设计理由：手动遥控器必须永远能按下"停"。
+ *   QUERY   保活/诊断 —— 总是执行，代价小且不改变执行器状态。
+ *   CONTROL 运动/配置 —— 只有"当前控制权拥有者"能执行。
+ */
+#define CMD_CLASS_SAFETY        0u
+#define CMD_CLASS_QUERY         1u
+#define CMD_CLASS_CONTROL       2u
 
 /* 故障码 */
 #define FAULT_NONE              0x00u
@@ -306,6 +410,76 @@
   #define STEPPER_MAX_OVERLAP_MS    3000u
 #endif
 
+/* ============================ M6/M7：VL53L0X TOF ×4 ============================ */
+/* 接口：I2C1，PB6 = SCL / PB7 = SDA，标准模式 100 kHz，4 颗共用一条总线。
+ *
+ * ⚠️ 4 颗 VL53L0X 出厂地址全是 0x29，上电后同时响应同一地址，
+ *    必须靠 XSHUT 逐个唤醒、逐个改地址（见 tof.c 的 Tof_Init）。
+ * ⚠️ 每个 XSHUT 必须 10 kΩ 下拉，否则上电瞬间芯片状态不确定，
+ *    地址分配会随机失败。
+ */
+#define I2C1_GPIO_PORT          GPIOB
+#define I2C1_GPIO_CLK           RCC_APB2Periph_GPIOB
+#define I2C1_SCL_PIN            GPIO_Pin_6
+#define I2C1_SDA_PIN            GPIO_Pin_7
+#define I2C1_CLK                RCC_APB1Periph_I2C1
+#define I2C1_PERIPH             I2C1
+#define I2C1_SPEED_HZ           100000u     /* 100 kHz：4 颗共用时更稳 */
+#define I2C1_TIMEOUT_LOOPS      60000u      /* 单个事件轮询的超时计数（约 3 ms @72MHz）*/
+
+/* ---------- 传感器拓扑（说明书 §5.3）----------
+ *                     [TOF3]      前脸：测障碍（朝前）
+ *              [TOF1]       [TOF2] 底部左/右：测桌面（朝下）
+ *                     [TOF0]      底部前：测桌面（朝下）
+ *
+ *  ⚠️ 底部三颗危险方向是【距离变远】（桌沿），
+ *     前脸那颗危险方向是【距离变近】（障碍）—— 语义相反，不能共用阈值。
+ */
+#define TOF_COUNT               4u
+#define TOF_EDGE_NUM            3u          /* 0..2 是底部桌沿传感器 */
+
+/* XSHUT 必须接在互相独立的 GPIO 上 */
+#define TOF_XSHUT_PORTS         { GPIOA, GPIOA, GPIOA, GPIOB }
+#define TOF_XSHUT_PINS          { GPIO_Pin_4, GPIO_Pin_5, GPIO_Pin_8, GPIO_Pin_5 }
+
+#define TOF_ADDR_DEFAULT        0x29u       /* 出厂地址（4 颗全同）*/
+#define TOF_ADDR_BASE           0x30u       /* 改地址后：TOF0..3 = 0x30..0x33 */
+
+/* 按物理编号固定分配地址（说明书 §5.3.4）：
+ * 未启用的传感器只是不初始化、不参与地址分配，已启用的仍保持固定地址，
+ * 这样排查时"哪颗是 TOF2"永远是 0x32，不会因为改动启用集而漂移。 */
+#define TOF_CFG_BIT(n)          (CFG_TOF0_EN << (n))
+#define TOF_IS_EDGE(n)          ((n) < TOF_EDGE_NUM)
+
+/* ---------- 测量参数 ---------- */
+#define TOF_TIMING_BUDGET_US    20000u      /* 20 ms（VL53L0X 允许的最小值）*/
+#define TOF_MEASURE_TIMEOUT_MS  120u        /* 单次测量超时 */
+#define TOF_POLL_DEFAULT_MS     10u         /* 两颗之间的间隔（TOF_CFG 可调）*/
+#define TOF_POLL_MIN_MS         10u
+#define TOF_POLL_MAX_MS         255u
+
+#define TOF_RANGE_MAX_MM        2000        /* 超过此值视为无效 */
+#define TOF_RANGE_INVALID_MM    8190        /* 无回波时寄存器常给出的值 */
+
+/* ---------- 桌沿（底部三颗）：距离变远 = 危险 ---------- */
+#define TOF_EDGE_MM             80          /* 超过 -> 判定桌沿 */
+#define TOF_EDGE_RECOVER_MM     60          /* 回到此值以下才解除 */
+#define TOF_EDGE_DEBOUNCE       3u          /* 连续 3 次确认 */
+
+/* ---------- 障碍（前脸一颗）：距离变近 = 危险 ---------- */
+#define TOF_OBSTACLE_MM         150         /* 小于 -> 判定障碍 */
+#define TOF_OBSTACLE_RECOVER_MM 200         /* 远离到此值以上才解除 */
+#define TOF_OBSTACLE_DEBOUNCE   2u          /* 连续 2 次确认 */
+
+/* ---------- 桌沿触发后的自动回退 ---------- */
+#define TOF_EDGE_BACKOFF_STEPS  200         /* 反向回退的步数 */
+#define TOF_EDGE_BACKOFF_HZ     120u        /* 回退慢速，避免二次失控 */
+
+/* ---------- 距离上报 ---------- */
+/* TOF_DATA 事件周期。太密会占用 115200 链路，太稀上位机看不到实时距离。
+ * 18 字节/次 @200ms ≈ 90 B/s，可接受。 */
+#define TOF_DATA_PERIOD_MS      200u
+
 /* ============================ 看门狗 ============================ */
 /* LSI 约 40 kHz，预分频 64 -> 625 Hz；重装 1000 -> 约 1.6 s */
 #define APP_IWDG_PRESCALER      IWDG_Prescaler_64
@@ -337,9 +511,35 @@
 #define CFG_TOF2_EN             (1u << 5)   /* 底部右：桌沿 */
 #define CFG_TOF3_EN             (1u << 6)   /* 前脸：障碍 */
 
-/* 默认：舵机/蓝牙关闭，TTS/TOF 开启（见说明书 §2.3、§5.6.1）*/
-#define CFG_DEFAULT             (CFG_TTS_EN | CFG_TOF0_EN | CFG_TOF1_EN | \
-                                 CFG_TOF2_EN | CFG_TOF3_EN)
+/* 默认：舵机关闭；TTS/蓝牙/TOF 开启。
+ *
+ * 蓝牙默认开启的理由：它只是"多一种控制入口"，没插模块时
+ * USART3 收不到任何数据，对系统完全无副作用（RX 上拉，无噪声中断）。
+ *
+ * ⚠️ 已经烧过固件的板子，配置存在 Flash 里，改这个宏【不会生效】。
+ *    需要手动发一次：  s 0000004E
+ *    或者先清空 Flash 配置页再上电。
+ */
+/* ★ 2026-11-01 按实际硬件改为【两颗 TOF】：
+ *      TOF0 = 底部前 → 桌沿
+ *      TOF3 = 前脸   → 障碍
+ *    TOF1 / TOF2（底部左 / 右）没有模块，默认关闭。
+ *
+ *    配置字 = TTS(0x02) | BT(0x04) | TOF0(0x08) | TOF3(0x40) = 0x4E
+ *
+ *   ⚠️ 只有一颗底部传感器时，桌沿保护【有方向盲区】：
+ *      · 前进  → 有保护（TOF0 就在前方底面）
+ *      · 后退  → 没有保护！尾部先掉下去，而 TOF0 仍在桌面上方
+ *      · 转向  → 只有前向参考，侧向越界发现不了
+ *   详见 docs/TOF两传感器配置说明.md
+ */
+#define CFG_DEFAULT             (CFG_TTS_EN | CFG_BT_EN | \
+                                 CFG_TOF0_EN | CFG_TOF3_EN)
+
+/* 补上 TOF1/TOF2 之后（三颗底部全开）改成：
+ *   #define CFG_DEFAULT  (CFG_TTS_EN | CFG_BT_EN | CFG_TOF0_EN | \
+ *                         CFG_TOF1_EN | CFG_TOF2_EN | CFG_TOF3_EN)   // 0x7E
+ */
 
 /* 底部三颗 TOF 的掩码，用于盲走判定 */
 #define CFG_BOTTOM_TOF_MASK     (CFG_TOF0_EN | CFG_TOF1_EN | CFG_TOF2_EN)

@@ -47,4 +47,42 @@
 #define STEPPER_SPEED_2             2
 #define STEPPER_SPEED_3             3
 
+/* ---------------- TOF（M6/M7）---------------- */
+#define TOF_COUNT               4u
+#define TOF_EDGE_NUM            3u
+#define TOF_EDGE_MM             80
+#define TOF_EDGE_RECOVER_MM     60
+#define TOF_EDGE_DEBOUNCE       3u
+#define TOF_OBSTACLE_MM         150
+#define TOF_OBSTACLE_RECOVER_MM 200
+#define TOF_OBSTACLE_DEBOUNCE   2u
+#define TOF_RANGE_MAX_MM        2000
+#define TOF_POLL_MIN_MS         10u
+#define TOF_POLL_MAX_MS         255u
+
+/* ---------------- 命令操作码（双命令源仲裁用）---------------- */
+#define OP_MOVE                 0x01u
+#define OP_SERVO                0x02u
+#define OP_TTS                  0x03u
+#define OP_TOF_CFG              0x04u
+#define OP_CLEAR_FAULT          0x05u
+#define OP_PING                 0x06u
+#define OP_SET_CONFIG           0x07u
+#define OP_GET_CONFIG           0x08u
+#define OP_STEPPER_STAT         0x09u
+#define OP_LINK_STAT            0x0Au
+#define OP_STEPPER_TEST         0x0Bu
+#define OP_MOTOR_STOP           0x0Cu
+
+#define MOVE_DIR_FORWARD        0x00u
+#define MOVE_DIR_BACKWARD       0x01u
+#define MOVE_DIR_TURN_LEFT      0x02u
+#define MOVE_DIR_TURN_RIGHT     0x03u
+#define MOVE_DIR_STOP           0x04u
+
+/* ---------------- 命令优先级分类 ---------------- */
+#define CMD_CLASS_SAFETY        0u
+#define CMD_CLASS_QUERY         1u
+#define CMD_CLASS_CONTROL       2u
+
 #endif /* __APP_CONFIG_H */
