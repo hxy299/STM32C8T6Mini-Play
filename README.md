@@ -147,6 +147,8 @@
 │   ├── 上位机对接手册.md        ★ 上位机看这份
 │   └── 蓝牙遥控与双源仲裁.md
 └── tools/
+    ├── mcu_link_example.c     ★ A7Z 侧可运行的 C 参考实现
+    ├── test_mcu_link_example.py  它的端到端回归测试（pty + 假 MCU）
     ├── pc_link_test.py    ★ PC 端交互测试工具
     ├── selftest_pc_tool.py
     ├── check_source_sanity.py   源码卫生（转义残留 / BOM / 换行）
@@ -346,6 +348,24 @@ python tools/pc_link_test.py COM7 --dcal
 ---
 
 ## 8. 验证与测试
+
+### A7Z 侧 C 示例（对接上位机时直接抄）
+
+`tools/mcu_link_example.c` 是一份 **400 多行、可直接编译运行** 的上位机参考实现，
+包含组帧、CRC、拆帧状态机、串口 raw 配置、心跳与事件处理。
+
+```bash
+gcc -std=c99 -Wall -Wextra -O2 -o mcu_link tools/mcu_link_example.c
+./mcu_link /dev/ttyS4 --probe      # 只探活
+./mcu_link /dev/ttyS4 --demo       # 前进 2000 步再停
+./mcu_link /dev/ttyS4 --monitor    # 只心跳 + 打印事件
+```
+
+它自带一个端到端回归测试（用 pty 造虚拟串口 + 假 MCU，不需要硬件）：
+
+```bash
+python3 tools/test_mcu_link_example.py ./mcu_link
+```
 
 ### 主机单元测试（不需要硬件，在 PC 上跑）
 
